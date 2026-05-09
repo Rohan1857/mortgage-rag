@@ -1,0 +1,8 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+vector_db/
+data/raw_pdfs/
+data/extracted_markdown/
