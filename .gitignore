@@ -6,3 +6,4 @@ __pycache__/
 vector_db/
 data/raw_pdfs/
 data/extracted_markdown/
+data/extracted_json/
