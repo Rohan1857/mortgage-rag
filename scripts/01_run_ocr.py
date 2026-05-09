@@ -2,16 +2,88 @@ import os
 import re
 import json
 import html
+import base64
+import io
 from html.parser import HTMLParser
 import fitz  # PyMuPDF
 import ollama
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Robust Paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INPUT_DIR = os.path.join(BASE_DIR, "data", "raw_pdfs")
 OUTPUT_DIR = os.path.join(BASE_DIR, "data", "extracted_markdown")
 JSON_OUTPUT_DIR = os.path.join(BASE_DIR, "data", "extracted_json")
-OCR_MODEL = "maternion/LightOnOCR-2:latest"
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "ollama").lower()
+OCR_MODEL = os.getenv("OCR_MODEL", "maternion/LightOnOCR-2:latest")
+OCR_API_BASE = os.getenv("OCR_API_BASE", "").strip()
+OCR_TIMEOUT = float(os.getenv("OCR_TIMEOUT", "120"))
+OCR_OUTPUT_MODE = os.getenv("OCR_OUTPUT_MODE", "both").lower()
+
+DEFAULT_OPENAI_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "grok": "https://api.x.ai/v1",
+}
+
+def _resolve_openai_base_url(provider):
+    if OCR_API_BASE:
+        return OCR_API_BASE
+    shared_base = os.getenv("OPENAI_BASE_URL", "").strip()
+    if shared_base:
+        return shared_base
+    return DEFAULT_OPENAI_BASE_URLS.get(provider, "")
+
+def _get_provider_api_key(provider):
+    if provider == "openai":
+        return os.getenv("OPENAI_API_KEY", "")
+    if provider == "openrouter":
+        return os.getenv("OPENROUTER_API_KEY", "")
+    if provider == "groq":
+        return os.getenv("GROQ_API_KEY", "")
+    if provider == "grok":
+        return os.getenv("XAI_API_KEY", "")
+    if provider == "gemini":
+        return os.getenv("GEMINI_API_KEY", "")
+    if provider == "huggingface":
+        return os.getenv("HUGGINGFACE_API_KEY", "")
+    return os.getenv("OCR_API_KEY", "")
+
+def _image_to_data_url(img_bytes):
+    encoded = base64.b64encode(img_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+def _extract_markdown_from_json(text):
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return text
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+
+    if not isinstance(payload, dict):
+        return text
+
+    pages = payload.get("pages")
+    if isinstance(pages, list) and pages:
+        page = pages[0] if isinstance(pages[0], dict) else None
+        if page:
+            for key in ("raw_markdown", "markdown", "text"):
+                value = page.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+    return text
+
+def _should_write_markdown():
+    return OCR_OUTPUT_MODE in {"markdown", "both"}
+
+def _should_write_json():
+    return OCR_OUTPUT_MODE in {"json", "both"}
 
 class _TableHTMLParser(HTMLParser):
     def __init__(self):
@@ -217,6 +289,7 @@ def _strip_markdown_fence(text):
     return text
 
 def _sanitize_ocr_markdown(text):
+    text = _extract_markdown_from_json(text)
     text = _strip_markdown_fence(text)
     text = _convert_html_tables_to_markdown(text)
     text = _repair_markdown_tables(text)
@@ -399,6 +472,102 @@ def _markdown_to_json(page_markdown, page_number):
         "raw_markdown": page_markdown.strip(),
     }
 
+def _ocr_via_ollama(img_bytes, system_prompt, user_prompt):
+    response = ollama.generate(
+        model=OCR_MODEL,
+        system=system_prompt,
+        prompt=user_prompt,
+        images=[img_bytes],
+        options={"temperature": 0},
+    )
+    return response.get("response", "")
+
+def _ocr_via_openai_compatible(img_bytes, system_prompt, user_prompt, provider):
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai package is required for this OCR provider.") from exc
+
+    api_key = _get_provider_api_key(provider)
+    base_url = _resolve_openai_base_url(provider)
+    client = OpenAI(api_key=api_key, base_url=base_url or None)
+    data_url = _image_to_data_url(img_bytes)
+
+    response = client.chat.completions.create(
+        model=OCR_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+def _ocr_via_gemini(img_bytes, system_prompt, user_prompt):
+    try:
+        import google.generativeai as genai
+    except ImportError as exc:
+        raise RuntimeError("google-generativeai is required for Gemini OCR.") from exc
+
+    api_key = _get_provider_api_key("gemini")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini OCR.")
+
+    genai.configure(api_key=api_key)
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for Gemini OCR.") from exc
+
+    image = Image.open(io.BytesIO(img_bytes))
+    model = genai.GenerativeModel(
+        model_name=OCR_MODEL,
+        system_instruction=system_prompt,
+    )
+    response = model.generate_content([user_prompt, image])
+    return getattr(response, "text", "") or ""
+
+def _extract_hf_text(payload):
+    if isinstance(payload, list) and payload:
+        if isinstance(payload[0], dict):
+            for key in ("generated_text", "text", "summary_text"):
+                value = payload[0].get(key)
+                if value:
+                    return value
+        if isinstance(payload[0], str):
+            return payload[0]
+    if isinstance(payload, dict):
+        for key in ("generated_text", "text", "summary_text"):
+            value = payload.get(key)
+            if value:
+                return value
+    if isinstance(payload, str):
+        return payload
+    return ""
+
+def _ocr_via_huggingface(img_bytes, system_prompt, user_prompt):
+    api_key = _get_provider_api_key("huggingface")
+    if not api_key:
+        raise RuntimeError("HUGGINGFACE_API_KEY is required for Hugging Face OCR.")
+
+    api_url = os.getenv(
+        "HUGGINGFACE_API_URL",
+        f"https://api-inference.huggingface.co/models/{OCR_MODEL}",
+    )
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    response = requests.post(api_url, headers=headers, data=img_bytes, timeout=OCR_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+
+    return _extract_hf_text(payload)
+
 def render_page_to_target_resolution(page, target_long_edge=1540):
     """
     Renders a PDF page dynamically so its longest dimension is exactly
@@ -420,8 +589,10 @@ def render_page_to_target_resolution(page, target_long_edge=1540):
     return pix.tobytes("png")
 
 def convert_pdf_to_markdown():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(JSON_OUTPUT_DIR, exist_ok=True)
+    if _should_write_markdown():
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if _should_write_json():
+        os.makedirs(JSON_OUTPUT_DIR, exist_ok=True)
     
     if not os.path.exists(INPUT_DIR):
         print(f"Directory {INPUT_DIR} does not exist. Creating it...")
@@ -434,35 +605,25 @@ def convert_pdf_to_markdown():
         print(f"No PDFs found in {INPUT_DIR}.")
         return
 
-    print(f"Configuring Ollama Connection to {OCR_MODEL}...")
-    
-    # Warm up step: check if model is pulled
-    try:
-        ollama.show(OCR_MODEL)
-    except ollama.ResponseError:
-        print(f"Model {OCR_MODEL} not found. Pulling it now...")
-        ollama.pull(OCR_MODEL)
+    print(f"Configuring OCR provider '{OCR_PROVIDER}' with model '{OCR_MODEL}'...")
 
-    # Construct a highly rigid system instruction to enforce GFM tables and ban HTML output
-   # Hardened GFM prompt with strict vertical boundaries to prevent table merging
-  # JSON-forced prompt with strict layout guardrails
-    structured_ocr_prompt = (
-        "You are a strict document data extraction engine. Convert this image into a structured JSON object. "
-        "The JSON MUST follow this exact schema:\n"
-        "{\n"
-        "  \"pages\": [\n"
-        "    {\n"
-        "      \"page_number\": 1,\n"
-        "      \"raw_markdown\": \"The complete text and tables of the page...\"\n"
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "When generating the string for the 'raw_markdown' field, you MUST obey these physical layout rules:\n"
+    if OCR_PROVIDER == "ollama":
+        try:
+            ollama.show(OCR_MODEL)
+        except ollama.ResponseError:
+            print(f"Model {OCR_MODEL} not found. Pulling it now...")
+            ollama.pull(OCR_MODEL)
+
+    default_system_prompt = (
+        "You are a strict document data extraction engine. Convert the image into clean GitHub Flavored Markdown (GFM). "
+        "Follow these rules exactly:\n"
         "1. NO HTML: Use only markdown pipes (|) for tables.\n"
-        "2. TABLE BOUNDARIES (CRITICAL): Do NOT merge separate sections. If a new header (like ###) begins, end the current table. Never place a markdown header (#) inside a table cell.\n"
+        "2. TABLE BOUNDARIES: Do NOT merge separate sections. If a new header (like ###) begins, end the current table. Never place a markdown header (#) inside a table cell.\n"
         "3. HORIZONTAL DRIFT: Break side-by-side visual elements into vertical sequential blocks instead of creating ultra-wide rows.\n"
         "4. EMPTY CELLS: Write 'NaN' in visually empty table cells to maintain column alignment."
     )
+    structured_ocr_prompt = os.getenv("OCR_SYSTEM_PROMPT", default_system_prompt)
+    user_prompt = os.getenv("OCR_USER_PROMPT", "Transcribe this page into Markdown only.")
 
     for filename in pdf_files:
         pdf_path = os.path.join(INPUT_DIR, filename)
@@ -485,14 +646,21 @@ def convert_pdf_to_markdown():
             
             try:
                 # Direct API call to the local Ollama vision pipeline with explicit prompt instructions
-                response = ollama.generate(
-                    model=OCR_MODEL,
-                    system=structured_ocr_prompt,
-                    prompt="Transcribe this page into Markdown only.",
-                    images=[img_bytes],
-                    options={"temperature": 0},
-                )
-                page_text = response.get("response", "")
+                if OCR_PROVIDER == "ollama":
+                    page_text = _ocr_via_ollama(img_bytes, structured_ocr_prompt, user_prompt)
+                elif OCR_PROVIDER in {"openai", "openrouter", "groq", "grok"}:
+                    page_text = _ocr_via_openai_compatible(
+                        img_bytes,
+                        structured_ocr_prompt,
+                        user_prompt,
+                        OCR_PROVIDER,
+                    )
+                elif OCR_PROVIDER == "gemini":
+                    page_text = _ocr_via_gemini(img_bytes, structured_ocr_prompt, user_prompt)
+                elif OCR_PROVIDER == "huggingface":
+                    page_text = _ocr_via_huggingface(img_bytes, structured_ocr_prompt, user_prompt)
+                else:
+                    raise RuntimeError(f"Unsupported OCR_PROVIDER: {OCR_PROVIDER}")
                 page_text_clean = _sanitize_ocr_markdown(page_text)
 
                 final_markdown += f"## Page {page_num + 1}\n{page_text_clean}\n\n"
@@ -501,17 +669,19 @@ def convert_pdf_to_markdown():
             except Exception as e:
                 print(f"    Error on page {page_num+1}: {e}")
                 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(final_markdown)
-        print(f"Saved OCR markdown output to: {output_path}")
+        if _should_write_markdown():
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(final_markdown)
+            print(f"Saved OCR markdown output to: {output_path}")
 
         doc_payload = {
             "source_file": filename,
             "pages": page_payloads,
         }
-        with open(json_output_path, "w", encoding="utf-8") as f:
-            json.dump(doc_payload, f, indent=2, ensure_ascii=True)
-        print(f"Saved OCR JSON output to: {json_output_path}")
+        if _should_write_json():
+            with open(json_output_path, "w", encoding="utf-8") as f:
+                json.dump(doc_payload, f, indent=2, ensure_ascii=True)
+            print(f"Saved OCR JSON output to: {json_output_path}")
 
     print("\nAll extractions complete! Highly structured markdown documents generated with NaN mappings.")
 
