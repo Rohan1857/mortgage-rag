@@ -184,6 +184,9 @@ def _load_json_documents(json_dir: str) -> list:
     return documents
 
 def build_database_with_metadata():
+    embed_provider = os.getenv("EMBED_PROVIDER", "ollama").lower()
+    embed_model = os.getenv("EMBED_MODEL", "qwen3-embedding:0.6b")
+    print(f"Embedding model selected: {embed_provider}/{embed_model}")
     print("Configuring embedding provider...")
     Settings.embed_model = _build_embedding_model()
     Settings.llm = None  # No chat model needed for indexing

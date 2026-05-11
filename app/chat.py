@@ -163,6 +163,7 @@ def _build_chat_llm():
     temperature = float(os.getenv("CHAT_TEMPERATURE", "0"))
     request_timeout = float(os.getenv("CHAT_TIMEOUT", "300"))
     context_window = int(os.getenv("CHAT_CONTEXT_WINDOW", "8192"))
+    reasoning_effort = os.getenv("CHAT_REASONING_EFFORT", "none").strip().lower()
 
     if provider == "ollama":
         num_ctx = int(os.getenv("CHAT_NUM_CTX", "4096"))
@@ -181,12 +182,16 @@ def _build_chat_llm():
     if provider in {"openrouter", "groq", "grok"}:
         api_key = _get_provider_api_key(provider, override_key)
         api_base = _resolve_openai_base_url(provider, override_base)
+        additional_kwargs = {}
+        if reasoning_effort:
+            additional_kwargs["reasoning_effort"] = reasoning_effort
         return OpenAICompatibleLLM(
             model=model,
             api_key=api_key,
             api_base=api_base or None,
             temperature=temperature,
             context_window=context_window,
+            additional_kwargs=additional_kwargs,
         )
 
     if provider == "gemini":
@@ -301,8 +306,21 @@ def start_chat():
             # stream_chat prints the words the millisecond the GPU generates them
             response = chat_engine.stream_chat(user_input)
             
+            in_think_block = False
             for token in response.response_gen:
-                print(token, end="", flush=True)
+                if not token:
+                    continue
+                if "<think>" in token:
+                    in_think_block = True
+                    token = token.split("<think>", 1)[0]
+                if in_think_block:
+                    if "</think>" in token:
+                        in_think_block = False
+                        token = token.split("</think>", 1)[1]
+                    else:
+                        continue
+                if token:
+                    print(token, end="", flush=True)
             print("\n") 
             
         except Exception as e:

@@ -4,6 +4,7 @@ import json
 import html
 import base64
 import io
+import time
 from html.parser import HTMLParser
 import fitz  # PyMuPDF
 import ollama
@@ -22,6 +23,10 @@ OCR_MODEL = os.getenv("OCR_MODEL", "maternion/LightOnOCR-2:latest")
 OCR_API_BASE = os.getenv("OCR_API_BASE", "").strip()
 OCR_TIMEOUT = float(os.getenv("OCR_TIMEOUT", "120"))
 OCR_OUTPUT_MODE = os.getenv("OCR_OUTPUT_MODE", "both").lower()
+DATALAB_API_BASE = os.getenv("DATALAB_API_BASE", "https://www.datalab.to/api/v1").strip()
+DATALAB_MODE = os.getenv("DATALAB_MODE", "fast").strip().lower()
+DATALAB_POLL_INTERVAL = float(os.getenv("DATALAB_POLL_INTERVAL", "2"))
+DATALAB_MAX_WAIT = float(os.getenv("DATALAB_MAX_WAIT", "300"))
 
 DEFAULT_OPENAI_BASE_URLS = {
     "openai": "https://api.openai.com/v1",
@@ -51,6 +56,8 @@ def _get_provider_api_key(provider):
         return os.getenv("GEMINI_API_KEY", "")
     if provider == "huggingface":
         return os.getenv("HUGGINGFACE_API_KEY", "")
+    if provider == "datalab":
+        return os.getenv("DATALAB_API_KEY", "")
     return os.getenv("OCR_API_KEY", "")
 
 def _image_to_data_url(img_bytes):
@@ -568,6 +575,86 @@ def _ocr_via_huggingface(img_bytes, system_prompt, user_prompt):
 
     return _extract_hf_text(payload)
 
+def _build_datalab_output_format():
+    if OCR_OUTPUT_MODE in {"json", "both"}:
+        return "markdown,json"
+    return "markdown"
+
+def _ocr_via_datalab(file_bytes, file_name, page_range=None):
+    api_key = _get_provider_api_key("datalab")
+    if not api_key:
+        raise RuntimeError("DATALAB_API_KEY is required for Datalab OCR.")
+
+    convert_url = f"{DATALAB_API_BASE.rstrip('/')}/convert"
+    headers = {"X-API-Key": api_key}
+    output_format = _build_datalab_output_format()
+
+    payload = {
+        "mode": DATALAB_MODE,
+        "output_format": output_format,
+    }
+    if page_range is not None:
+        payload["page_range"] = page_range
+
+    def _post_convert(files):
+        return requests.post(
+            convert_url,
+            data=payload,
+            files=files,
+            headers=headers,
+            timeout=OCR_TIMEOUT,
+        )
+
+    files_primary = {"file.0": (file_name, file_bytes, "application/pdf")}
+    response = _post_convert(files_primary)
+    if response.status_code in {400, 422}:
+        files_fallback = {"file": (file_name, file_bytes, "application/pdf")}
+        response = _post_convert(files_fallback)
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = response.text.strip() or response.reason
+        try:
+            payload_json = response.json()
+            if isinstance(payload_json, dict):
+                detail = payload_json.get("detail") or payload_json.get("error") or detail
+        except ValueError:
+            pass
+        raise RuntimeError(f"Datalab convert failed ({response.status_code}): {detail}") from exc
+
+    submit = response.json()
+
+    if not submit.get("success", True):
+        raise RuntimeError(submit.get("error") or "Datalab convert request failed.")
+
+    request_check_url = submit.get("request_check_url")
+    request_id = submit.get("request_id")
+    if not request_check_url and request_id:
+        request_check_url = f"{DATALAB_API_BASE.rstrip('/')}/convert/{request_id}"
+    if not request_check_url:
+        raise RuntimeError("Datalab convert response missing request_check_url.")
+
+    start = time.time()
+    while True:
+        if time.time() - start > DATALAB_MAX_WAIT:
+            raise RuntimeError("Datalab convert timed out waiting for result.")
+
+        poll = requests.get(request_check_url, headers=headers, timeout=OCR_TIMEOUT)
+        poll.raise_for_status()
+        result = poll.json()
+
+        if not result.get("success", True):
+            raise RuntimeError(result.get("error") or "Datalab convert failed.")
+
+        if result.get("status") == "complete":
+            markdown = result.get("markdown") or ""
+            if not markdown:
+                raise RuntimeError("Datalab convert completed without markdown output.")
+            return markdown, result.get("json")
+
+        time.sleep(DATALAB_POLL_INTERVAL)
+
 def render_page_to_target_resolution(page, target_long_edge=1540):
     """
     Renders a PDF page dynamically so its longest dimension is exactly
@@ -607,6 +694,17 @@ def convert_pdf_to_markdown():
 
     print(f"Configuring OCR provider '{OCR_PROVIDER}' with model '{OCR_MODEL}'...")
 
+    page_limit_raw = input(
+        "How many pages should be parsed per PDF? (Enter a number or press Enter for all): "
+    ).strip()
+    page_limit = None
+    if page_limit_raw:
+        try:
+            page_limit = max(1, int(page_limit_raw))
+        except ValueError:
+            print("Invalid page count. Defaulting to all pages.")
+            page_limit = None
+
     if OCR_PROVIDER == "ollama":
         try:
             ollama.show(OCR_MODEL)
@@ -633,38 +731,54 @@ def convert_pdf_to_markdown():
         
         print(f"\nProcessing {filename}...")
         doc = fitz.open(pdf_path)
+        pdf_bytes = None
+        if OCR_PROVIDER == "datalab":
+            with open(pdf_path, "rb") as pdf_file:
+                pdf_bytes = pdf_file.read()
         final_markdown = f"# Mortgage Record: {filename}\n\n"
         page_payloads = []
         
-        for page_num in range(len(doc)):
+        total_pages = len(doc)
+        pages_to_process = total_pages if page_limit is None else min(page_limit, total_pages)
+        for page_num in range(pages_to_process):
             page = doc[page_num]
-            
-            # Target the 1540px limit recommended by LightOn OCR developers
-            img_bytes = render_page_to_target_resolution(page, target_long_edge=1540)
             
             print(f"  - OCR Processing on Page {page_num + 1}...")
             
             try:
                 # Direct API call to the local Ollama vision pipeline with explicit prompt instructions
-                if OCR_PROVIDER == "ollama":
-                    page_text = _ocr_via_ollama(img_bytes, structured_ocr_prompt, user_prompt)
-                elif OCR_PROVIDER in {"openai", "openrouter", "groq", "grok"}:
-                    page_text = _ocr_via_openai_compatible(
-                        img_bytes,
-                        structured_ocr_prompt,
-                        user_prompt,
-                        OCR_PROVIDER,
+                datalab_json = None
+                if OCR_PROVIDER == "datalab":
+                    page_text, datalab_json = _ocr_via_datalab(
+                        pdf_bytes,
+                        filename,
+                        page_range=str(page_num),
                     )
-                elif OCR_PROVIDER == "gemini":
-                    page_text = _ocr_via_gemini(img_bytes, structured_ocr_prompt, user_prompt)
-                elif OCR_PROVIDER == "huggingface":
-                    page_text = _ocr_via_huggingface(img_bytes, structured_ocr_prompt, user_prompt)
                 else:
-                    raise RuntimeError(f"Unsupported OCR_PROVIDER: {OCR_PROVIDER}")
+                    # Target the 1540px limit recommended by LightOn OCR developers
+                    img_bytes = render_page_to_target_resolution(page, target_long_edge=1540)
+                    if OCR_PROVIDER == "ollama":
+                        page_text = _ocr_via_ollama(img_bytes, structured_ocr_prompt, user_prompt)
+                    elif OCR_PROVIDER in {"openai", "openrouter", "groq", "grok"}:
+                        page_text = _ocr_via_openai_compatible(
+                            img_bytes,
+                            structured_ocr_prompt,
+                            user_prompt,
+                            OCR_PROVIDER,
+                        )
+                    elif OCR_PROVIDER == "gemini":
+                        page_text = _ocr_via_gemini(img_bytes, structured_ocr_prompt, user_prompt)
+                    elif OCR_PROVIDER == "huggingface":
+                        page_text = _ocr_via_huggingface(img_bytes, structured_ocr_prompt, user_prompt)
+                    else:
+                        raise RuntimeError(f"Unsupported OCR_PROVIDER: {OCR_PROVIDER}")
                 page_text_clean = _sanitize_ocr_markdown(page_text)
 
                 final_markdown += f"## Page {page_num + 1}\n{page_text_clean}\n\n"
-                page_payloads.append(_markdown_to_json(page_text_clean, page_num + 1))
+                page_payload = _markdown_to_json(page_text_clean, page_num + 1)
+                if datalab_json and _should_write_json():
+                    page_payload["datalab_raw_json"] = datalab_json
+                page_payloads.append(page_payload)
                 
             except Exception as e:
                 print(f"    Error on page {page_num+1}: {e}")
