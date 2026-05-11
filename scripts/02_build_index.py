@@ -200,16 +200,26 @@ def build_database_with_metadata():
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
     documents = []
-    if os.path.exists(json_dir) and os.listdir(json_dir):
-        print("Loading structured JSON documents...")
-        documents = _load_json_documents(json_dir)
-    elif os.path.exists(data_dir) and os.listdir(data_dir):
-        print("Loading raw Markdown documents...")
-        reader = SimpleDirectoryReader(data_dir)
-        documents = reader.load_data()
+    source_mode = os.getenv("INDEX_SOURCE", "json").strip().lower()
+    if source_mode == "markdown":
+        if os.path.exists(data_dir) and os.listdir(data_dir):
+            print("Loading raw Markdown documents...")
+            reader = SimpleDirectoryReader(data_dir)
+            documents = reader.load_data()
+        else:
+            print(f"No Markdown files found in {data_dir}. Run your OCR first.")
+            return
     else:
-        print(f"No OCR files found in {json_dir} or {data_dir}. Run your OCR first.")
-        return
+        if os.path.exists(json_dir) and os.listdir(json_dir):
+            print("Loading structured JSON documents...")
+            documents = _load_json_documents(json_dir)
+        elif os.path.exists(data_dir) and os.listdir(data_dir):
+            print("Loading raw Markdown documents...")
+            reader = SimpleDirectoryReader(data_dir)
+            documents = reader.load_data()
+        else:
+            print(f"No OCR files found in {json_dir} or {data_dir}. Run your OCR first.")
+            return
 
     # Apply Metadata Enrichment to the raw documents
     for doc in documents:

@@ -5,7 +5,9 @@ import requests
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.embeddings import BaseEmbedding
+from llama_index.core.base.llms.types import LLMMetadata, MessageRole
 from llama_index.llms.ollama import Ollama
+from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 import chromadb
@@ -95,6 +97,27 @@ class HuggingFaceInferenceEmbedding(BaseEmbedding):
     def _get_text_embeddings(self, texts):
         return [self._request_embedding(text) for text in texts]
 
+
+class OpenAICompatibleLLM(OpenAI):
+    def __init__(self, *args, context_window: int = 8192, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._context_window_override = context_window
+
+    @property
+    def _tokenizer(self):
+        return None
+
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            context_window=self._context_window_override,
+            num_output=self.max_tokens or -1,
+            is_chat_model=True,
+            is_function_calling_model=True,
+            model_name=self.model,
+            system_role=MessageRole.SYSTEM,
+        )
+
 def _build_embedding_model():
     provider = os.getenv("EMBED_PROVIDER", "ollama").lower()
     model = os.getenv("EMBED_MODEL", "qwen3-embedding:0.6b")
@@ -139,6 +162,7 @@ def _build_chat_llm():
     override_base = os.getenv("CHAT_API_BASE", "")
     temperature = float(os.getenv("CHAT_TEMPERATURE", "0"))
     request_timeout = float(os.getenv("CHAT_TIMEOUT", "300"))
+    context_window = int(os.getenv("CHAT_CONTEXT_WINDOW", "8192"))
 
     if provider == "ollama":
         num_ctx = int(os.getenv("CHAT_NUM_CTX", "4096"))
@@ -149,15 +173,21 @@ def _build_chat_llm():
             additional_kwargs={"num_ctx": num_ctx},
         )
 
-    if provider in {"openai", "openrouter", "groq", "grok"}:
-        try:
-            from llama_index.llms.openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("llama-index-llms-openai is required for this provider.") from exc
-
+    if provider == "openai":
         api_key = _get_provider_api_key(provider, override_key)
         api_base = _resolve_openai_base_url(provider, override_base)
         return OpenAI(model=model, api_key=api_key, api_base=api_base or None, temperature=temperature)
+
+    if provider in {"openrouter", "groq", "grok"}:
+        api_key = _get_provider_api_key(provider, override_key)
+        api_base = _resolve_openai_base_url(provider, override_base)
+        return OpenAICompatibleLLM(
+            model=model,
+            api_key=api_key,
+            api_base=api_base or None,
+            temperature=temperature,
+            context_window=context_window,
+        )
 
     if provider == "gemini":
         try:
@@ -189,6 +219,12 @@ def start_chat():
     db_path = os.path.join(BASE_DIR, "vector_db")
 
     # 3. Set Models from .env provider configuration
+    chat_provider = os.getenv("CHAT_PROVIDER", "ollama").lower()
+    chat_model = os.getenv("CHAT_MODEL", "qwen2.5:1.5b")
+    embed_provider = os.getenv("EMBED_PROVIDER", "ollama").lower()
+    embed_model = os.getenv("EMBED_MODEL", "qwen3-embedding:0.6b")
+    logger.info("Chat model selected: %s/%s", chat_provider, chat_model)
+    logger.info("Embedding model selected: %s/%s", embed_provider, embed_model)
     logger.info("Loading chat and embedding models from .env configuration...")
     Settings.llm = _build_chat_llm()
     Settings.embed_model = _build_embedding_model()
@@ -224,13 +260,15 @@ def start_chat():
         "You are a strict data extraction AI. You analyze structured mortgage documents. "
         "Your task is to answer questions using ONLY the provided text context and metadata. "
         "Observe these rules strictly:\n"
-        "1. If you are confused, the data is missing, or the context does not contain the answer, "
-        "reply ONLY with: 'I don't know.' Do not attempt to guess.\n"
-        "2. Some columns, tables, or fields in the document may be empty or contain blank values. "
+        "1. Answer only what is explicitly asked. Do not add extra information.\n"
+        "2. Do not show reasoning, chain-of-thought, or analysis. Never output <think> blocks.\n"
+        "3. If you are confused, the data is missing, or the context does not contain the answer, "
+        "reply ONLY with: I don't know. Do not add any other words or punctuation.\n"
+        "4. Some columns, tables, or fields in the document may be empty or contain blank values. "
         "If asked about these, state clearly that the value is empty or not provided. Never hallucinate any numbers.\n"
-        "3. Always check the Metadata block (e.g., account_holder, account_number) prepended to the "
+        "5. Always check the Metadata block (e.g., account_holder, account_number) prepended to the "
         "retrieved context to ensure you are associating data with the correct customer.\n"
-        "4. Be extremely concise. Give the direct answer immediately without conversational filler. "
+        "6. Be extremely concise. Give the direct answer immediately without conversational filler. "
         "Keep answers under 2 sentences."
     )
     
