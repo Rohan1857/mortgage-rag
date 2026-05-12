@@ -87,10 +87,10 @@ def _extract_markdown_from_json(text):
     return text
 
 def _should_write_markdown():
-    return OCR_OUTPUT_MODE in {"markdown", "both"}
+    return OCR_OUTPUT_MODE in {"markdown", "both", "markdown-json"}
 
 def _should_write_json():
-    return OCR_OUTPUT_MODE in {"json", "both"}
+    return OCR_OUTPUT_MODE in {"json", "both", "markdown-json"}
 
 class _TableHTMLParser(HTMLParser):
     def __init__(self):
@@ -294,6 +294,32 @@ def _strip_markdown_fence(text):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
+
+def _extract_code_blocks(text):
+    """
+    Extracts markdown and json blocks from the LLM response.
+    """
+    markdown_content = ""
+    json_content = ""
+    
+    # Try to find ```markdown ... ```
+    md_match = re.search(r"```markdown\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if md_match:
+        markdown_content = md_match.group(1).strip()
+    
+    # Try to find ```json ... ```
+    json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if json_match:
+        json_content = json_match.group(1).strip()
+        
+    # If no markdown block found, but there is a json block, the rest might be markdown or just plain text
+    if not markdown_content:
+        # Remove the json block and see what's left
+        text_no_json = re.sub(r"```json\s*(.*?)\s*```", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if text_no_json:
+            markdown_content = _strip_markdown_fence(text_no_json)
+            
+    return markdown_content, json_content
 
 def _sanitize_ocr_markdown(text):
     text = _extract_markdown_from_json(text)
@@ -516,29 +542,63 @@ def _ocr_via_openai_compatible(img_bytes, system_prompt, user_prompt, provider):
     )
     return response.choices[0].message.content or ""
 
+# Global counter for Gemini rotation
+_GEMINI_ROTATION_IDX = 0
+
 def _ocr_via_gemini(img_bytes, system_prompt, user_prompt):
+    global _GEMINI_ROTATION_IDX
     try:
-        import google.generativeai as genai
-    except ImportError as exc:
-        raise RuntimeError("google-generativeai is required for Gemini OCR.") from exc
-
-    api_key = _get_provider_api_key("gemini")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is required for Gemini OCR.")
-
-    genai.configure(api_key=api_key)
-    try:
+        from google import genai
+        from google.genai import types
         from PIL import Image
     except ImportError as exc:
-        raise RuntimeError("Pillow is required for Gemini OCR.") from exc
+        raise RuntimeError("google-genai and Pillow are required for Gemini OCR.") from exc
 
+    gemini_keys = [
+        os.getenv("GEMINI_API_KEY"),
+        os.getenv("GEMINI_API_KEY_1"),
+        os.getenv("GEMINI_API_KEY_2"),
+        os.getenv("GEMINI_API_KEY_3")
+    ]
+    valid_keys = [k for k in gemini_keys if k and k.strip()]
+    if not valid_keys:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini OCR.")
+
+    # Rotate key
+    api_key = valid_keys[_GEMINI_ROTATION_IDX % len(valid_keys)]
+    _GEMINI_ROTATION_IDX += 1
+
+    client = genai.Client(api_key=api_key)
+    
+    # User specified model
+    model = "gemma-4-31b-it"
+    
     image = Image.open(io.BytesIO(img_bytes))
-    model = genai.GenerativeModel(
-        model_name=OCR_MODEL,
-        system_instruction=system_prompt,
+    
+    # Combining system and user prompt
+    full_prompt = (
+        f"{system_prompt}\n\n"
+        "IMPORTANT: Your response must contain exactly TWO sections:\n"
+        "1. A markdown representation of the document in a ```markdown block.\n"
+        "2. A structured JSON representation of the document in a ```json block.\n\n"
+        f"Task: {user_prompt}"
     )
-    response = model.generate_content([user_prompt, image])
-    return getattr(response, "text", "") or ""
+    
+    # Configure according to user snippet
+    config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level="HIGH")
+    )
+    
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=[full_prompt, image],
+            config=config
+        )
+        return response.text or ""
+    except Exception as e:
+        print(f"❌ Gemini OCR failed: {e}")
+        raise e
 
 def _extract_hf_text(payload):
     if isinstance(payload, list) and payload:
@@ -767,15 +827,38 @@ def convert_pdf_to_markdown():
                             OCR_PROVIDER,
                         )
                     elif OCR_PROVIDER == "gemini":
-                        page_text = _ocr_via_gemini(img_bytes, structured_ocr_prompt, user_prompt)
+                        raw_response = _ocr_via_gemini(img_bytes, structured_ocr_prompt, user_prompt)
+                        page_text, gemini_json_str = _extract_code_blocks(raw_response)
+                        
+                        # Handle JSON from Gemini
+                        if gemini_json_str:
+                            try:
+                                gemini_json_data = json.loads(gemini_json_str)
+                            except:
+                                gemini_json_data = None
+                        else:
+                            gemini_json_data = None
                     elif OCR_PROVIDER == "huggingface":
                         page_text = _ocr_via_huggingface(img_bytes, structured_ocr_prompt, user_prompt)
+                        gemini_json_data = None
                     else:
                         raise RuntimeError(f"Unsupported OCR_PROVIDER: {OCR_PROVIDER}")
+
                 page_text_clean = _sanitize_ocr_markdown(page_text)
 
                 final_markdown += f"## Page {page_num + 1}\n{page_text_clean}\n\n"
-                page_payload = _markdown_to_json(page_text_clean, page_num + 1)
+                
+                # If we got JSON from Gemini, use it or merge it
+                if gemini_json_data:
+                    page_payload = gemini_json_data
+                    # Ensure page number is set
+                    if isinstance(page_payload, dict):
+                        page_payload["page_number"] = page_num + 1
+                        if "raw_markdown" not in page_payload:
+                            page_payload["raw_markdown"] = page_text_clean
+                else:
+                    page_payload = _markdown_to_json(page_text_clean, page_num + 1)
+                
                 if datalab_json and _should_write_json():
                     page_payload["datalab_raw_json"] = datalab_json
                 page_payloads.append(page_payload)

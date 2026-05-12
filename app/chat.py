@@ -19,6 +19,7 @@ DEFAULT_OPENAI_BASE_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
     "groq": "https://api.groq.com/openai/v1",
     "grok": "https://api.x.ai/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
 }
 
 # 1. Setup Advanced Logging
@@ -53,6 +54,8 @@ def _get_provider_api_key(provider, override):
         return os.getenv("GEMINI_API_KEY", "")
     if provider == "huggingface":
         return os.getenv("HUGGINGFACE_API_KEY", "")
+    if provider == "cerebras":
+        return os.getenv("CEREBRAS_API_KEY", "")
     return ""
 
 def _mean_pool(vectors):
@@ -155,10 +158,10 @@ def _build_embedding_model():
 
     raise RuntimeError(f"Unsupported EMBED_PROVIDER: {provider}")
 
-def _build_chat_llm():
+def _build_chat_llm(api_key_override: str = None):
     provider = os.getenv("CHAT_PROVIDER", "ollama").lower()
     model = os.getenv("CHAT_MODEL", "qwen2.5:1.5b")
-    override_key = os.getenv("CHAT_API_KEY", "")
+    override_key = api_key_override or os.getenv("CHAT_API_KEY", "")
     override_base = os.getenv("CHAT_API_BASE", "")
     temperature = float(os.getenv("CHAT_TEMPERATURE", "0"))
     request_timeout = float(os.getenv("CHAT_TIMEOUT", "300"))
@@ -179,12 +182,13 @@ def _build_chat_llm():
         api_base = _resolve_openai_base_url(provider, override_base)
         return OpenAI(model=model, api_key=api_key, api_base=api_base or None, temperature=temperature)
 
-    if provider in {"openrouter", "groq", "grok"}:
+    if provider in {"openrouter", "groq", "grok", "cerebras"}:
         api_key = _get_provider_api_key(provider, override_key)
         api_base = _resolve_openai_base_url(provider, override_base)
         additional_kwargs = {}
-        if reasoning_effort:
+        if reasoning_effort and reasoning_effort != "none":
             additional_kwargs["reasoning_effort"] = reasoning_effort
+        
         return OpenAICompatibleLLM(
             model=model,
             api_key=api_key,
@@ -281,6 +285,8 @@ def start_chat():
         chat_mode="context", 
         verbose=False, 
         system_prompt=strict_system_prompt,
+        similarity_top_k=3,  # Fetch top 5 chunks
+        
     )
     
     print("\n" + "="*60)
