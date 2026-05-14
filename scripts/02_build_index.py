@@ -208,14 +208,25 @@ def build_database_with_metadata():
     
     # NEW: Hybrid loading for 'markdown-json' mode
     if ocr_mode == "markdown-json" or source_mode == "both":
-        print("Hybrid Mode: Loading both Markdown and JSON documents...")
+        print(f"{'='*60}")
+        print("🧬 HYBRID DATA MODE DETECTED")
+        print("📥 Storing BOTH Markdown and JSON into Vector Database...")
+        print(f"{'='*60}")
+        
         if os.path.exists(data_dir):
             print("  - Loading Markdown documents...")
             reader = SimpleDirectoryReader(data_dir)
-            documents.extend(reader.load_data())
+            md_docs = reader.load_data()
+            documents.extend(md_docs)
+            print(f"    ✅ Found {len(md_docs)} Markdown files.")
+            
         if os.path.exists(json_dir):
             print("  - Loading JSON documents...")
-            documents.extend(_load_json_documents(json_dir))
+            js_docs = _load_json_documents(json_dir)
+            documents.extend(js_docs)
+            print(f"    ✅ Found {len(js_docs)} JSON files.")
+        
+        print(f"✨ Total Document Sources Ingested: {len(documents)}")
     
     elif source_mode == "markdown":
         if os.path.exists(data_dir) and os.listdir(data_dir):

@@ -16,13 +16,14 @@ from typing import List, Dict, Tuple
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, "eval_checkpoint.json")
 
-def save_checkpoint(stats: Dict, total_semantic_score: float, user_id: str, current_pdf_id: str = None, current_pdf_results: List = None):
+def save_checkpoint(stats: Dict, total_semantic_score: float, user_id: str, current_pdf_id: str = None, current_pdf_results: List = None, current_is_uploaded: bool = False):
     """Saves current stats and state to a local file."""
     checkpoint_data = {
         "user_id": user_id,
         "stats": stats,
         "total_semantic_score": total_semantic_score,
         "current_pdf_id": current_pdf_id,
+        "current_is_uploaded": current_is_uploaded,
         "current_pdf_results": [
             (res.model_dump() if hasattr(res, 'model_dump') else res.dict() if hasattr(res, 'dict') else res)
             for res in (current_pdf_results or [])
@@ -176,50 +177,90 @@ def run_evaluation_pipeline():
                     print(f"    ⚠️  Skipped: QA data (_qa.json) not found for this PDF.")
                     continue
 
-                print(f"    📸 Starting OCR Extraction...")
-
+                # Prepare for OCR
                 with open(qa_path, 'r', encoding='utf-8') as f:
                     qa_data = json.load(f)
 
                 # Resumption logic for the current PDF
                 current_pdf_results = []
                 start_idx = 0
+                is_uploaded = checkpoint_data.get("current_is_uploaded", False)
+                
+                # Check if this PDF was already partially done
                 if checkpoint_data.get("current_pdf_id") == pdf_id:
                     current_pdf_results_raw = checkpoint_data.get("current_pdf_results", [])
                     current_pdf_results = [EvaluationResult(**res) for res in current_pdf_results_raw]
                     start_idx = len(current_pdf_results)
                     if start_idx > 0:
                         print(f"    ⏩ Resuming {pdf_name} from question {start_idx + 1}")
+                else:
+                    # If it's a new PDF, reset is_uploaded unless it's in processed_files
+                    for pf in stats.get("processed_files", []):
+                        if pf["filename"] == pdf_name and pf.get("is_uploaded"):
+                            is_uploaded = True
+                            break
 
-                # 2. Extract OCR
-                print("    📸 Starting OCR Extraction...")
-                ocr_results = ocr_engine.extract_text(pdf_path)
-                extracted_markdown = ocr_results.get("markdown", "")
-                extracted_json = ocr_results.get("json", "")
+                # Cleanup vector DB ONLY if we are NOT resuming this specific PDF
+                db_path = os.path.join("temp_eval", "vector_db")
+                if checkpoint_data.get("current_pdf_id") != pdf_id:
+                    if os.path.exists(db_path):
+                        try:
+                            shutil.rmtree(db_path)
+                            print("    🧹 Cleaned temporary vector database for new file.")
+                        except Exception as e:
+                            print(f"    ⚠️  Note: Vector DB cleanup skipped (already handled by in-memory client).")
+
+                # 2. Extract or Load OCR from Cache
+                base_name = os.path.splitext(pdf_name)[0]
+                cache_md = os.path.join("temp_eval", f"OCR_{base_name}.md")
+                cache_js = os.path.join("temp_eval", f"OCR_{base_name}.json")
+                
+                mode = os.getenv("OCR_OUTPUT_MODE", "markdown-json")
+                
+                # Check cache based on mode
+                cache_hit = False
+                if mode == "markdown":
+                    cache_hit = os.path.exists(cache_md)
+                else: # markdown-json
+                    cache_hit = os.path.exists(cache_md) and os.path.exists(cache_js)
+
+                if cache_hit:
+                    print(f"    ♻️  Found cached OCR results for {pdf_name}. Skipping extraction.")
+                    with open(cache_md, 'r', encoding='utf-8') as f:
+                        extracted_markdown = f.read()
+                    
+                    extracted_json = ""
+                    if mode == "markdown-json":
+                        with open(cache_js, 'r', encoding='utf-8') as f:
+                            extracted_json = f.read()
+                            
+                    ocr_results = {"markdown": extracted_markdown, "json": extracted_json}
+                else:
+                    print("    📸 Starting OCR Extraction...")
+                    ocr_results = ocr_engine.extract_text(pdf_path)
+                    extracted_markdown = ocr_results.get("markdown", "")
+                    extracted_json = ocr_results.get("json", "")
+                    
+                    # Save to local cache
+                    with open(cache_md, 'w', encoding='utf-8') as f:
+                        f.write(extracted_markdown)
+                    if extracted_json:
+                        with open(cache_js, 'w', encoding='utf-8') as f:
+                            f.write(extracted_json)
             
                 # 3. Immediate OCR Upload (Ensures data is saved even if evaluation fails)
-                print(f"    🚀 Uploading standalone OCR results to Drive...")
-                try:
-                    # Upload Markdown
-                    drive.upload_to_user_folder(
-                        content=extracted_markdown,
-                        filename=f"OCR_{pdf_name.replace('.pdf', '.md')}",
-                        user_id=user_id,
-                        mime_type="text/markdown"
-                    )
-                    
-                    # Upload JSON
-                    if extracted_json:
-                        drive.upload_to_user_folder(
-                            content=extracted_json,
-                            filename=f"OCR_{pdf_name.replace('.pdf', '.json')}",
-                            user_id=user_id,
-                            mime_type="application/json"
-                        )
-                    
-                    print("    ✅ Standalone OCR (MD & JSON) uploaded successfully.")
-                except Exception as e:
-                    print(f"    ⚠️  Note: Standalone OCR upload failed (skipping): {e}")
+                if not is_uploaded:
+                    print(f"    🚀 Uploading standalone OCR results to Drive...")
+                    try:
+                        drive.upload_to_user_folder(extracted_markdown, f"OCR_{pdf_name.replace('.pdf', '.md')}", user_id, "text/markdown")
+                        if extracted_json:
+                            drive.upload_to_user_folder(extracted_json, f"OCR_{pdf_name.replace('.pdf', '.json')}", user_id, "application/json")
+                        print(f"    ✅ Standalone OCR (MD & JSON) uploaded successfully.")
+                        is_uploaded = True
+                    except Exception as e:
+                        print(f"    ⚠️  Note: Standalone OCR upload failed (skipping): {e}")
+                else:
+                    print(f"    ♻️  OCR already uploaded to Drive. Skipping.")
 
                 # 4. Evaluation Loop
                 for res in llm_engine.evaluate_document(ocr_results, qa_data, start_idx=start_idx):
@@ -241,8 +282,11 @@ def run_evaluation_pipeline():
                     if res.is_correct:
                         stats["accuracy_by_category"][cat]["correct"] += 1
                     
-                    # Save Checkpoint after each question
-                    save_checkpoint(stats, total_semantic_score, user_id, current_pdf_id=pdf_id, current_pdf_results=current_pdf_results)
+                    # Save Checkpoint after each question, including upload status
+                    save_checkpoint(stats, total_semantic_score, user_id, 
+                                    current_pdf_id=pdf_id, 
+                                    current_pdf_results=current_pdf_results,
+                                    current_is_uploaded=is_uploaded)
 
                 # Document completed
                 correct_in_doc = sum(1 for res in current_pdf_results if res.is_correct)
@@ -288,16 +332,9 @@ def run_evaluation_pipeline():
                 print(f"    ✅ File Complete ({correct_in_doc}/{total_in_doc} correct)")
 
             except Exception as e:
-                err_msg = str(e).lower()
                 print(f"    ❌ Error processing {pdf_name}: {e}")
-                
-                # Detect Rate Limits or Auth Errors to stop the loop
-                fatal_keywords = ["rate limit", "429", "resource exhausted", "quota", "invalid_grant"]
-                if any(k in err_msg for k in fatal_keywords):
-                    print(f"\n🛑 Fatal error detected: {e}. Stopping evaluation to save progress.")
-                    break
-                
-                continue
+                print(f"\n🛑 Stopping evaluation to save progress. You can resume from this PDF later.")
+                break
     except KeyboardInterrupt:
         print("\n\n👋 Evaluation interrupted by user. Generating summary for processed files...")
 

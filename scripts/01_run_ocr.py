@@ -322,10 +322,11 @@ def _extract_code_blocks(text):
     return markdown_content, json_content
 
 def _sanitize_ocr_markdown(text):
+    """
+    Minimal sanitization: extracts from JSON if needed and strips code fences.
+    """
     text = _extract_markdown_from_json(text)
     text = _strip_markdown_fence(text)
-    text = _convert_html_tables_to_markdown(text)
-    text = _repair_markdown_tables(text)
     return text.strip()
 
 def _repair_markdown_tables(text):
@@ -571,34 +572,51 @@ def _ocr_via_gemini(img_bytes, system_prompt, user_prompt):
     client = genai.Client(api_key=api_key)
     
     # User specified model
-    model = "gemma-4-31b-it"
+    model = os.getenv("OCR_MODEL", "gemini-1.5-flash")
     
     image = Image.open(io.BytesIO(img_bytes))
     
-    # Combining system and user prompt
-    full_prompt = (
-        f"{system_prompt}\n\n"
-        "IMPORTANT: Your response must contain exactly TWO sections:\n"
-        "1. A markdown representation of the document in a ```markdown block.\n"
-        "2. A structured JSON representation of the document in a ```json block.\n\n"
-        f"Task: {user_prompt}"
-    )
+    # Mode-aware prompt for Gemini
+    mode = os.getenv("OCR_OUTPUT_MODE", "markdown-json")
+    if mode == "markdown":
+        full_prompt = (
+            "Your task is to analyze the provided image and return exactly ONE code block:\n\n"
+            "1. A ```markdown block: A clean, GitHub Flavored Markdown (GFM) transcription of the entire document.\n\n"
+            "IMPORTANT- MERGED CELLS: If a cell spans multiple rows (e.g., '1-4 units' covering several sub-rows), explicitly REPEAT that value in every single corresponding row in the Markdown table. Do not leave any row incomplete."
+        )
+    else:
+        full_prompt = ("Your task is to analyze the provided image and return exactly TWO distinct code blocks:\n\n"
+            "1. A ```markdown block: A clean, GitHub Flavored Markdown (GFM) transcription. "
+            "2. A ```json block: A comprehensive structured JSON representation of the document. "
+            "Extract all key-value pairs, nested sections, and tabular data into a logical hierarchy.\n\n"
+           
+            "- In the JSON, maintain accurate data types (numbers, dates, etc.) where possible.\n"
+            "IMORTANT- MERGED CELLS: If a cell spans multiple rows (e.g., '1-4 units' covering several sub-rows), explicitly REPEAT that value in every single corresponding row in both Markdown and JSON. Do not leave any row incomplete."
+        )
     
     # Configure according to user snippet
     config = types.GenerateContentConfig(
         thinking_config=types.ThinkingConfig(thinking_level="HIGH")
     )
     
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=[full_prompt, image],
-            config=config
-        )
-        return response.text or ""
-    except Exception as e:
-        print(f"❌ Gemini OCR failed: {e}")
-        raise e
+    # Try the request with retries for transient 500 errors
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[full_prompt, image],
+                config=config
+            )
+            return response.text or ""
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "500" in err_msg and attempt < 2:
+                print(f"⚠️  Gemini Internal Error (500). Retrying {attempt+1}/3...")
+                time.sleep(2)
+                continue
+                
+            print(f"❌ Gemini OCR failed: {e}")
+            raise e
 
 def _extract_hf_text(payload):
     if isinstance(payload, list) and payload:
@@ -715,24 +733,11 @@ def _ocr_via_datalab(file_bytes, file_name, page_range=None):
 
         time.sleep(DATALAB_POLL_INTERVAL)
 
-def render_page_to_target_resolution(page, target_long_edge=1540):
+def render_page_to_image(page, dpi=300):
     """
-    Renders a PDF page dynamically so its longest dimension is exactly
-    target_long_edge (1540px), maintaining aspect ratio as recommended by LightOnOCR.
+    Renders a PDF page to a PNG image with a fixed DPI.
     """
-    rect = page.rect
-    width = rect.width
-    height = rect.height
-    
-    # Calculate the scale factor needed to make the longest side target_long_edge
-    if width >= height:
-        scale = target_long_edge / width
-    else:
-        scale = target_long_edge / height
-        
-    # Generate the high-quality matrix with the computed scale
-    matrix = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=matrix)
+    pix = page.get_pixmap(dpi=dpi)
     return pix.tobytes("png")
 
 def convert_pdf_to_markdown():
@@ -774,11 +779,8 @@ def convert_pdf_to_markdown():
 
     default_system_prompt = (
         "You are a strict document data extraction engine. Convert the image into clean GitHub Flavored Markdown (GFM). "
-        "Follow these rules exactly:\n"
-        "1. NO HTML: Use only markdown pipes (|) for tables.\n"
-        "2. TABLE BOUNDARIES: Do NOT merge separate sections. If a new header (like ###) begins, end the current table. Never place a markdown header (#) inside a table cell.\n"
-        "3. HORIZONTAL DRIFT: Break side-by-side visual elements into vertical sequential blocks instead of creating ultra-wide rows.\n"
-        "4. EMPTY CELLS: Write 'NaN' in visually empty table cells to maintain column alignment."
+       "IMORTANT- MERGED CELLS: If a cell spans multiple rows (e.g., '1-4 units' covering several sub-rows), explicitly REPEAT that value in every single corresponding row in both Markdown and JSON. Do not leave any row incomplete."
+        
     )
     structured_ocr_prompt = os.getenv("OCR_SYSTEM_PROMPT", default_system_prompt)
     user_prompt = os.getenv("OCR_USER_PROMPT", "Transcribe this page into Markdown only.")
@@ -807,7 +809,10 @@ def convert_pdf_to_markdown():
             
             try:
                 # Direct API call to the local Ollama vision pipeline with explicit prompt instructions
+                # Reset provider-specific data
                 datalab_json = None
+                gemini_json_data = None
+                
                 if OCR_PROVIDER == "datalab":
                     page_text, datalab_json = _ocr_via_datalab(
                         pdf_bytes,
@@ -815,8 +820,8 @@ def convert_pdf_to_markdown():
                         page_range=str(page_num),
                     )
                 else:
-                    # Target the 1540px limit recommended by LightOn OCR developers
-                    img_bytes = render_page_to_target_resolution(page, target_long_edge=1540)
+                    # Standard high-resolution rendering
+                    img_bytes = render_page_to_image(page, dpi=300)
                     if OCR_PROVIDER == "ollama":
                         page_text = _ocr_via_ollama(img_bytes, structured_ocr_prompt, user_prompt)
                     elif OCR_PROVIDER in {"openai", "openrouter", "groq", "grok"}:
@@ -829,6 +834,11 @@ def convert_pdf_to_markdown():
                     elif OCR_PROVIDER == "gemini":
                         raw_response = _ocr_via_gemini(img_bytes, structured_ocr_prompt, user_prompt)
                         page_text, gemini_json_str = _extract_code_blocks(raw_response)
+                        
+                        if gemini_json_str:
+                            print(f"    ✨ Gemini returned structured JSON + Markdown")
+                        else:
+                            print(f"    📝 Gemini returned Markdown only")
                         
                         # Handle JSON from Gemini
                         if gemini_json_str:

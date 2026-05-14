@@ -158,13 +158,13 @@ def _build_embedding_model():
 
     raise RuntimeError(f"Unsupported EMBED_PROVIDER: {provider}")
 
-def _build_chat_llm(api_key_override: str = None):
+def _build_chat_llm(api_key_override: str = None, timeout: float = None):
     provider = os.getenv("CHAT_PROVIDER", "ollama").lower()
     model = os.getenv("CHAT_MODEL", "qwen2.5:1.5b")
     override_key = api_key_override or os.getenv("CHAT_API_KEY", "")
     override_base = os.getenv("CHAT_API_BASE", "")
     temperature = float(os.getenv("CHAT_TEMPERATURE", "0"))
-    request_timeout = float(os.getenv("CHAT_TIMEOUT", "300"))
+    request_timeout = timeout or float(os.getenv("CHAT_TIMEOUT", "300"))
     context_window = int(os.getenv("CHAT_CONTEXT_WINDOW", "8192"))
     reasoning_effort = os.getenv("CHAT_REASONING_EFFORT", "none").strip().lower()
 
@@ -180,7 +180,13 @@ def _build_chat_llm(api_key_override: str = None):
     if provider == "openai":
         api_key = _get_provider_api_key(provider, override_key)
         api_base = _resolve_openai_base_url(provider, override_base)
-        return OpenAI(model=model, api_key=api_key, api_base=api_base or None, temperature=temperature)
+        return OpenAI(
+            model=model, 
+            api_key=api_key, 
+            api_base=api_base or None, 
+            temperature=temperature,
+            timeout=request_timeout
+        )
 
     if provider in {"openrouter", "groq", "grok", "cerebras"}:
         api_key = _get_provider_api_key(provider, override_key)
@@ -195,6 +201,7 @@ def _build_chat_llm(api_key_override: str = None):
             api_base=api_base or None,
             temperature=temperature,
             context_window=context_window,
+            timeout=request_timeout,
             additional_kwargs=additional_kwargs,
         )
 
